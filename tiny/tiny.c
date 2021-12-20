@@ -134,6 +134,7 @@ int parse_uri(char *uri, char *filename, char *cgiargs){
 void serve_static(int fd, char *filename, int filesize){
     int srcfd;
     char *srcp, filetype[MAXLINE], buf[MAXBUF];
+
     /* Send response headers to client */
     get_filetype(filename, filetype);
     sprintf(buf, "HTTP/1.0 200 OK\r\n");
@@ -147,17 +148,10 @@ void serve_static(int fd, char *filename, int filesize){
 
     /* Send response body to client */
     srcfd = Open(filename, O_RDONLY, 0);
-    
-    
-    srcp = (char *)malloc(filesize);
-    rio_readn(srcfd, srcp, filesize);
-    rio_writen(fd, srcp, filesize);
+    srcp = Mmap(0, filesize, PROT_READ, MAP_PRIVATE, srcfd, 0);
     Close(srcfd);
-    free(srcp);
-    // srcp = Mmap(0, filesize, PROT_READ, MAP_PRIVATE, srcfd, 0);
-    // Close(srcfd);
-    // Rio_writen(fd, srcp, filesize);
-    // Munmap(srcp, filesize);
+    Rio_writen(fd, srcp, filesize);
+    Munmap(srcp, filesize);
 }
 
 void get_filetype(char *filename, char *filetype){
@@ -172,9 +166,6 @@ void get_filetype(char *filename, char *filetype){
     }
     else if (strstr(filename, ".jpg")) {
         strcpy(filetype, "image/jpeg");
-    }
-    else if (strstr(filename, ".mp4")) {
-        strcpy(filetype, "video/mp4");
     }
     else {
         strcpy(filetype, "text/plain");
