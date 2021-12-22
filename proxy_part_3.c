@@ -7,6 +7,8 @@
 /* Recommended max cache and object sizes */
 #define MAX_CACHE_SIZE 1049000
 #define MAX_OBJECT_SIZE 102400
+#define CACHE_OBJS_COUNT 10 
+#define LRU_MAGIC_NUMBER 9999
 
 /* You won't lose style points for including this long line in your code */
 // HTTP header를 만들기 위한 상수들 
@@ -27,6 +29,191 @@ void parse_uri(char *uri,char *hostname,char *path,int *port);
 void build_http_header(char *http_header,char *hostname,char *path,int port,rio_t *client_rio);
 int connect_endServer(char *hostname,int port);
 void *thread(void *vargp);
+void cache_LRU(int index);
+void cache_init();
+int cache_find(char *url);
+void readerPre(int i);
+void readerAfter(int i);
+void writePre(int i);
+void writeAfter(int i);
+int cache_eviction();
+
+
+// 하나의 url에 대한 정보를 담기 위한 cache block 구조체
+typedef struct {
+    char cache_obj[MAX_OBJECT_SIZE];
+    char cache_url[MAXLINE];
+    int LRU;
+    int isEmpty;
+
+    int readCnt;            /*count of readers*/
+    sem_t wmutex;           /*protects accesses to cache*/
+    sem_t rdcntmutex;       /*protects accesses to readcnt*/
+
+    int writeCnt;
+    sem_t wtcntMutex;
+    sem_t queue;
+
+} cache_block;
+
+// 캐시를 표현하는 구조체 
+typedef struct {
+    cache_block cacheobjs[CACHE_OBJS_COUNT];  /*ten cache blocks*/
+    int cache_num;
+} Cache;
+
+// 캐시 
+Cache cache;
+
+// 캐시 초기화
+void cache_init(){
+
+    cache.cache_num = 0;
+    int i;
+    // 캐시 구조체 초기화 
+    for(i=0;i<CACHE_OBJS_COUNT;i++){
+        cache.cacheobjs[i].LRU = 0;
+        cache.cacheobjs[i].isEmpty = 1;
+        // write를 관리하는 mutex
+        Sem_init(&cache.cacheobjs[i].wmutex,0,1);
+        // read count의 접근을 관리하는 mutex
+        Sem_init(&cache.cacheobjs[i].rdcntmutex,0,1);
+        cache.cacheobjs[i].readCnt = 0;
+
+        cache.cacheobjs[i].writeCnt = 0;
+        // write count 접근을 관리하는 mutex
+        Sem_init(&cache.cacheobjs[i].wtcntMutex,0,1);
+        // read/write를 요청이 온 순서대로 처리하기 위한 mutex
+        Sem_init(&cache.cacheobjs[i].queue,0,1);
+    }
+}
+
+// 캐시 데이터를 읽기 전에 실행하는 함수
+void readerPre(int i){
+    // queue를 잠가서 다른 요청을 대기하게 만든다. 
+    P(&cache.cacheobjs[i].queue);
+    // read count를 잠그고 critical section 진입
+    P(&cache.cacheobjs[i].rdcntmutex);
+    cache.cacheobjs[i].readCnt++;
+    // Readcount가 1개 이상이면 write를 잠금
+    if(cache.cacheobjs[i].readCnt==1) P(&cache.cacheobjs[i].wmutex);
+    // readCnt에 대한 critical section 나왔으므로 unlock
+    V(&cache.cacheobjs[i].rdcntmutex);
+    // queue를 unlock하여 다른 스레드의 요청 허용 
+    V(&cache.cacheobjs[i].queue);
+}
+
+// 캐시 데이터를 읽고나서 실행하는 함수
+void readerAfter(int i){
+    // read count를 다루기 전에 lock
+    P(&cache.cacheobjs[i].rdcntmutex);
+    // read count를 1감소시키고 0이 되면 write가능하도록 Lock 해제
+    cache.cacheobjs[i].readCnt--;
+    if(cache.cacheobjs[i].readCnt==0) V(&cache.cacheobjs[i].wmutex);
+    // read count에 대한 잠금 해제 
+    V(&cache.cacheobjs[i].rdcntmutex);
+}
+
+// 캐시 데이터를 쓰기 전에 실행하는 함수 
+void writePre(int i){
+    P(&cache.cacheobjs[i].wtcntMutex);
+    cache.cacheobjs[i].writeCnt++;
+    if(cache.cacheobjs[i].writeCnt==1) P(&cache.cacheobjs[i].queue);
+    V(&cache.cacheobjs[i].wtcntMutex);
+    P(&cache.cacheobjs[i].wmutex);
+}
+
+// 캐시 데이터를 쓰고나서 실행하는 함수 
+void writeAfter(int i){
+    V(&cache.cacheobjs[i].wmutex);
+    P(&cache.cacheobjs[i].wtcntMutex);
+    cache.cacheobjs[i].writeCnt--;
+    if(cache.cacheobjs[i].writeCnt==0) V(&cache.cacheobjs[i].queue);
+    V(&cache.cacheobjs[i].wtcntMutex);
+}
+
+
+// 동일한 url을 가진 캐시 데이터가 있는지 확인 
+int cache_find(char *url){
+    int i;
+    for(i=0;i<CACHE_OBJS_COUNT;i++){
+        // LOCK
+        readerPre(i);
+        // cache에 url에 대응하는 정보가 있으면 break
+        if((cache.cacheobjs[i].isEmpty==0) && (strcmp(url,cache.cacheobjs[i].cache_url)==0)) break;
+        // UNLOCK
+        readerAfter(i);
+    }
+    // 캐시를 찾을 수 없는 경우 -1 반환
+    if(i>=CACHE_OBJS_COUNT) return -1; 
+    // 캐시 인덱스 반환
+    return i;
+}
+
+/*find the empty cacheObj or which cacheObj should be evictioned*/
+int cache_eviction(){
+    int min = LRU_MAGIC_NUMBER;
+    int minindex = 0;
+    int i;
+    for(i=0; i<CACHE_OBJS_COUNT; i++)
+    {
+        readerPre(i);
+        if(cache.cacheobjs[i].isEmpty == 1){/*choose if cache block empty */
+            minindex = i;
+            readerAfter(i);
+            break;
+        }
+        if(cache.cacheobjs[i].LRU< min){    /*if not empty choose the min LRU*/
+            minindex = i;
+            readerAfter(i);
+            continue;
+        }
+        readerAfter(i);
+    }
+
+    return minindex;
+}
+
+/*update the LRU number except the new cache one*/
+void cache_LRU(int index){
+
+    writePre(index);
+    cache.cacheobjs[index].LRU = LRU_MAGIC_NUMBER;
+    writeAfter(index);
+
+    int i;
+    for(i=0; i<index; i++)    {
+        writePre(i);
+        if(cache.cacheobjs[i].isEmpty==0 && i!=index){
+            cache.cacheobjs[i].LRU--;
+        }
+        writeAfter(i);
+    }
+    i++;
+    for(i; i<CACHE_OBJS_COUNT; i++)    {
+        writePre(i);
+        if(cache.cacheobjs[i].isEmpty==0 && i!=index){
+            cache.cacheobjs[i].LRU--;
+        }
+        writeAfter(i);
+    }
+}
+
+/*cache the uri and content in cache*/
+void cache_uri(char *uri,char *buf){
+    int i = cache_eviction();
+
+    writePre(i);/*writer P*/
+
+    strcpy(cache.cacheobjs[i].cache_obj,buf);
+    strcpy(cache.cacheobjs[i].cache_url,uri);
+    cache.cacheobjs[i].isEmpty = 0;
+
+    writeAfter(i);/*writer V*/
+
+    cache_LRU(i);
+}
+
 
 /*
   thread를 통해 처리하려고 하는 루틴을 만든다. 
@@ -60,12 +247,15 @@ int main(int argc,char **argv)
     pthread_t tid;
     char hostname[MAXLINE],port[MAXLINE];
     struct sockaddr_storage clientaddr;
+    // 캐시 초기화 
+    cache_init();
     // port를 입력하지 않은 경우는 에러메시지를 출력하고 프로그램 종료 
     if(argc != 2){
         fprintf(stderr,"usage :%s <port> \n",argv[0]);
         exit(1);
     }
     // 서버용 듣기 소켓을 만들어 준다. socket -> bind -> listen 
+    Signal(SIGPIPE, SIG_IGN);
     listenfd = Open_listenfd(argv[1]);
     while(1){
         clientlen = sizeof(clientaddr);
@@ -109,6 +299,19 @@ void doit(int connfd)
         return;
     }
 
+    char url_store[100];
+    strcpy(url_store,uri);
+    
+    int cache_index;
+    if((cache_index=cache_find(url_store))!=-1){ 
+    /*in cache then return the cache content*/
+        readerPre(cache_index);
+        Rio_writen(connfd,cache.cacheobjs[cache_index].cache_obj,
+                    strlen(cache.cacheobjs[cache_index].cache_obj));
+        readerAfter(cache_index);
+        cache_LRU(cache_index);
+        return;
+    }
     // URI를 파싱하여 hostname, path, port 정보를 얻어낸다. 
     parse_uri(uri,hostname,path,&port);
 
@@ -128,13 +331,25 @@ void doit(int connfd)
     // end server에게 HTTP request를 보낸다. 
     Rio_writen(end_serverfd,endserver_http_header,strlen(endserver_http_header));
 
+    /*store it*/
+    char cachebuf[MAX_OBJECT_SIZE];
+    int sizebuf = 0;
     size_t n;
     // end server로 부터 돌아온 response를 읽어서 값이 있으면 client에게 그대로 전달해준다. 
     while((n=Rio_readlineb(&server_rio,buf,MAXLINE))!=0)
     {
-        printf("proxy received %d bytes,then send\n",n);
+        sizebuf += n;
+        if(sizebuf < MAX_OBJECT_SIZE){
+            strcat(cachebuf, buf);
+        }
+        // printf("proxy received %d bytes,then send\n",n);
         Rio_writen(connfd,buf,n);
     }
+    
+    if(sizebuf < MAX_OBJECT_SIZE){
+        cache_uri(url_store,cachebuf);
+    }
+
     // end server의 소켓을 닫아준다. 
     Close(end_serverfd);
 }
