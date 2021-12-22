@@ -59,7 +59,6 @@ typedef struct {
 // 캐시를 표현하는 구조체 
 typedef struct {
     cache_block cacheobjs[CACHE_OBJS_COUNT];  /*ten cache blocks*/
-    int cache_num;
 } Cache;
 
 // 캐시 
@@ -67,8 +66,6 @@ Cache cache;
 
 // 캐시 초기화
 void cache_init(){
-
-    cache.cache_num = 0;
     int i;
     // 캐시 구조체 초기화 
     for(i=0;i<CACHE_OBJS_COUNT;i++){
@@ -100,7 +97,6 @@ void readerPre(int i){
     // readCnt에 대한 critical section 나왔으므로 unlock
     V(&cache.cacheobjs[i].rdcntmutex);
     // queue를 unlock하여 다른 스레드의 요청 허용 
-    // 이때 queue가 잠겨서 대기중인 스레드 중에서 1개 실행 허용하도록 함. 
     V(&cache.cacheobjs[i].queue);
 }
 
@@ -117,28 +113,19 @@ void readerAfter(int i){
 
 // 캐시 데이터를 쓰기 전에 실행하는 함수 
 void writePre(int i){
-    // write count 를 잠그고 critical section 진입
     P(&cache.cacheobjs[i].wtcntMutex);
-    // write count를 1증가 
     cache.cacheobjs[i].writeCnt++;
-    // write count가 1이되면 queue를 잠가서 다른 요청을 대기하게 한다. 
     if(cache.cacheobjs[i].writeCnt==1) P(&cache.cacheobjs[i].queue);
-    // Write count mutex 잠금 해제
     V(&cache.cacheobjs[i].wtcntMutex);
-    // write mutex 잠금 
     P(&cache.cacheobjs[i].wmutex);
 }
 
 // 캐시 데이터를 쓰고나서 실행하는 함수 
 void writeAfter(int i){
-    // write mutex 잠금 해제 
     V(&cache.cacheobjs[i].wmutex);
-    // write count 잠금
     P(&cache.cacheobjs[i].wtcntMutex);
     cache.cacheobjs[i].writeCnt--;
-    // write count 가 0이 되고 queue 해제
     if(cache.cacheobjs[i].writeCnt==0) V(&cache.cacheobjs[i].queue);
-    // write count mutex 해제 
     V(&cache.cacheobjs[i].wtcntMutex);
 }
 
@@ -150,7 +137,11 @@ int cache_find(char *url){
         // LOCK
         readerPre(i);
         // cache에 url에 대응하는 정보가 있으면 break
-        if((cache.cacheobjs[i].isEmpty==0) && (strcmp(url,cache.cacheobjs[i].cache_url)==0)) break;
+        if((cache.cacheobjs[i].isEmpty==0) && (strcmp(url,cache.cacheobjs[i].cache_url)==0)){
+            // UNLOCK
+            readerAfter(i);
+            break;
+        }
         // UNLOCK
         readerAfter(i);
     }
@@ -160,21 +151,20 @@ int cache_find(char *url){
     return i;
 }
 
-// 빈 캐시공간이나 퇴출시킬 캐시를 찾음.
+/*find the empty cacheObj or which cacheObj should be evictioned*/
 int cache_eviction(){
     int min = LRU_MAGIC_NUMBER;
     int minindex = 0;
     int i;
     for(i=0; i<CACHE_OBJS_COUNT; i++)
     {
-        // 캐시를 읽기전에 LOCK
         readerPre(i);
-        if(cache.cacheobjs[i].isEmpty == 1){// 캐시 공간이 비어있으면 LOCK해제하고 break
+        if(cache.cacheobjs[i].isEmpty == 1){/*choose if cache block empty */
             minindex = i;
             readerAfter(i);
             break;
         }
-        if(cache.cacheobjs[i].LRU< min){    // 캐시 공간이 비어있지 않은 경우는 LRU가 가장 작은 값을 찾아서 반환 
+        if(cache.cacheobjs[i].LRU < min){    /*if not empty choose the min LRU*/
             minindex = i;
             readerAfter(i);
             continue;
@@ -185,25 +175,17 @@ int cache_eviction(){
     return minindex;
 }
 
-// 새로운 캐시나 현재 사용된 캐시를 제외하고 나머지 LRU값을 바꾸어 줌
+/*update the LRU number except the new cache one*/
 void cache_LRU(int index){
-    // 새로운 캐시/현재 사용된 캐시는 적당히 큰 값을 LRU로 만들어준다. 
+
     writePre(index);
     cache.cacheobjs[index].LRU = LRU_MAGIC_NUMBER;
     writeAfter(index);
 
     int i;
-    // 비어있는 캐시가 아닌 경우 index를 제외하고 LRU값을 1씩 감소시켜준다. 
-    for(i=0; i<index; i++)    {
-        
-        writePre(i);
-        if(cache.cacheobjs[i].isEmpty==0 && i!=index){
-            cache.cacheobjs[i].LRU--;
-        }
-        writeAfter(i);
-    }
-    i++;
-    for(i; i<CACHE_OBJS_COUNT; i++)    {
+    for(i=0; i<CACHE_OBJS_COUNT; i++)    {
+        if (i == index) continue;
+
         writePre(i);
         if(cache.cacheobjs[i].isEmpty==0 && i!=index){
             cache.cacheobjs[i].LRU--;
@@ -267,10 +249,8 @@ int main(int argc,char **argv)
         fprintf(stderr,"usage :%s <port> \n",argv[0]);
         exit(1);
     }
-    // SIGPIPE signal을 무시해서 절단된 네트워크 소켓에 데이터를 쓰려고 했을 때 발생하는 시그널을 무시한다. 
-    // 무시하지 않으면 프로세스가 종료된다. 
-    Signal(SIGPIPE, SIG_IGN);
     // 서버용 듣기 소켓을 만들어 준다. socket -> bind -> listen 
+    Signal(SIGPIPE, SIG_IGN);
     listenfd = Open_listenfd(argv[1]);
     while(1){
         clientlen = sizeof(clientaddr);
@@ -294,6 +274,7 @@ void doit(int connfd)
 
     char buf[MAXLINE],method[MAXLINE],uri[MAXLINE],version[MAXLINE];
     char endserver_http_header [MAXLINE];
+    /*store the request line arguments*/
     char hostname[MAXLINE],path[MAXLINE];
     int port;
 
@@ -313,21 +294,16 @@ void doit(int connfd)
         return;
     }
 
-    // 현재 요청에 사용된 uri를 저장
     char url_store[100];
     strcpy(url_store,uri);
     
-    // 캐시를 확인하여 동일한 uri에 대한 데이터가 있는지 확인
     int cache_index;
     if((cache_index=cache_find(url_store))!=-1){ 
-        // 캐시를 읽어오기 전에 LOCK
+    /*in cache then return the cache content*/
         readerPre(cache_index);
-        // 캐시 데이터를 client에게 돌려줌
         Rio_writen(connfd,cache.cacheobjs[cache_index].cache_obj,
                     strlen(cache.cacheobjs[cache_index].cache_obj));
-        // LOCK 해제
         readerAfter(cache_index);
-        // 사용된 cache의 LRU를 바꾸어준다. 
         cache_LRU(cache_index);
         return;
     }
@@ -357,7 +333,6 @@ void doit(int connfd)
     // end server로 부터 돌아온 response를 읽어서 값이 있으면 client에게 그대로 전달해준다. 
     while((n=Rio_readlineb(&server_rio,buf,MAXLINE))!=0)
     {
-        // 캐시에 저장할 데이터 만들기 & 데이터 크기 count
         sizebuf += n;
         if(sizebuf < MAX_OBJECT_SIZE){
             strcat(cachebuf, buf);
@@ -366,7 +341,6 @@ void doit(int connfd)
         Rio_writen(connfd,buf,n);
     }
     
-    // 캐시에 저장할 수 있는 데이터인 경우 캐시에 저장.
     if(sizebuf < MAX_OBJECT_SIZE){
         cache_uri(url_store,cachebuf);
     }
